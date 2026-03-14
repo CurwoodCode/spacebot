@@ -67,6 +67,17 @@ impl std::fmt::Debug for MattermostAdapter {
 }
 
 impl MattermostAdapter {
+    /// Create a new [`MattermostAdapter`].
+    ///
+    /// `base_url` must be an origin URL with no path, query, or fragment
+    /// (e.g. `https://mm.example.com`). Returns an error if the URL is
+    /// malformed or includes a path component.
+    ///
+    /// `runtime_key` is the adapter's unique identifier within the messaging
+    /// manager (e.g. `"mattermost"` or `"mattermost:myinstance"`).
+    ///
+    /// `default_team_id` is used as a fallback when a WS event does not carry
+    /// a team ID in its broadcast envelope.
     pub fn new(
         runtime_key: impl Into<Arc<str>>,
         base_url: &str,
@@ -142,6 +153,12 @@ impl MattermostAdapter {
             })
     }
 
+    /// Validate a Mattermost resource ID (post, channel, user, etc.).
+    ///
+    /// A valid ID is 1–64 ASCII alphanumeric characters, hyphens, or
+    /// underscores. Returns an error for empty strings, IDs that are too long,
+    /// or IDs that contain characters outside that set (e.g. colons in
+    /// `dm:{user_id}` composite targets).
     fn validate_id(id: &str) -> crate::Result<()> {
         if id.is_empty() || id.len() > 64 {
             return Err(anyhow::anyhow!("invalid mattermost ID: empty or too long").into());
@@ -152,12 +169,25 @@ impl MattermostAdapter {
         Ok(())
     }
 
+    /// Cancel any active typing indicator for `channel_id`.
+    ///
+    /// Aborts the background loop that posts `/users/{id}/typing` and removes
+    /// it from the task map. No-op if no indicator is running.
     async fn stop_typing(&self, channel_id: &str) {
         if let Some(handle) = self.typing_tasks.write().await.remove(channel_id) {
             handle.abort();
         }
     }
 
+    /// Start a repeating typing indicator for `channel_id`.
+    ///
+    /// Spawns a background task that posts `/users/{bot_id}/typing` every
+    /// [`TYPING_INDICATOR_INTERVAL`]. Any previously running indicator for the
+    /// same channel is aborted first to prevent task leaks. The task runs until
+    /// [`stop_typing`](Self::stop_typing) is called or the adapter shuts down.
+    ///
+    /// Does nothing if `bot_user_id` has not been set (i.e. [`start`](Self::start)
+    /// has not been called yet).
     async fn start_typing(&self, channel_id: &str) {
         self.stop_typing(channel_id).await;
         let Some(user_id) = self.bot_user_id.get().cloned() else {
@@ -193,6 +223,14 @@ impl MattermostAdapter {
             .insert(channel_id.to_string(), handle);
     }
 
+    /// Create a new post in `channel_id` and return the created post.
+    ///
+    /// Pass `root_id` to place the post inside an existing thread; the root ID
+    /// must be the ID of the first post in that thread (not a reply). Pass
+    /// `None` to create a top-level post.
+    ///
+    /// Both `channel_id` and `root_id` (if provided) are validated with
+    /// [`validate_id`](Self::validate_id) before the request is sent.
     async fn create_post(
         &self,
         channel_id: &str,
@@ -234,6 +272,11 @@ impl MattermostAdapter {
             .map_err(Into::into)
     }
 
+    /// Replace the text of an existing post in-place.
+    ///
+    /// Used by the streaming path to update the placeholder post created by
+    /// [`StreamStart`](crate::OutboundResponse::StreamStart) as chunks arrive,
+    /// and to finalize it on [`StreamEnd`](crate::OutboundResponse::StreamEnd).
     async fn edit_post(&self, post_id: &str, message: &str) -> crate::Result<()> {
         Self::validate_id(post_id)?;
 
@@ -259,6 +302,13 @@ impl MattermostAdapter {
         Ok(())
     }
 
+    /// Fetch up to `limit` posts from `channel_id`, sorted by creation time.
+    ///
+    /// Pass `before_post_id` to retrieve posts that appeared before a specific
+    /// post (exclusive), which is used by [`fetch_history`](Self::fetch_history)
+    /// to anchor the history window to the triggering message. The Mattermost
+    /// API always returns the most recent matching posts first; callers are
+    /// responsible for reversing the order if needed.
     async fn get_channel_posts(
         &self,
         channel_id: &str,
@@ -302,6 +352,12 @@ impl MattermostAdapter {
             .map_err(Into::into)
     }
 
+    /// Return the Mattermost channel ID for a direct message conversation with
+    /// `user_id`, creating it via the API if it does not exist yet.
+    ///
+    /// Results are cached in `dm_channel_cache` so that subsequent calls for
+    /// the same user avoid a round-trip. Requires [`start`](Self::start) to
+    /// have been called so that `bot_user_id` is available.
     async fn get_or_create_dm_channel(&self, user_id: &str) -> crate::Result<String> {
         if let Some(channel_id) = self.dm_channel_cache.read().await.get(user_id).cloned() {
             return Ok(channel_id);
@@ -933,6 +989,25 @@ impl Messaging for MattermostAdapter {
     }
 }
 
+/// Convert a [`MattermostPost`] from a WebSocket event into an [`InboundMessage`],
+/// applying all permission filters.
+///
+/// Returns `None` (message dropped) when any of the following hold:
+/// - The post was authored by the bot itself.
+/// - A `team_filter` is configured and the event's team ID does not match, or
+///   the team ID is absent (fail-closed).
+/// - A `channel_filter` is configured and the channel is not in the allow-list
+///   for the event's team, or the team ID is absent (fail-closed).
+/// - The channel is a direct message (`channel_type = "D"`) and either
+///   `dm_allowed_users` is empty or the sender is not listed.
+///
+/// When a message passes all filters the following metadata keys are set:
+/// `message_id`, `mattermost_post_id`, `mattermost_channel_id`,
+/// `mattermost_team_id` (if known), `mattermost_root_id` (if in a thread),
+/// `sender_display_name` (if `display_name` is provided),
+/// `mattermost_channel_name` and `channel_name` (if `channel_name` is provided),
+/// and `mattermost_mentions_or_replies_to_bot` (true when the message text
+/// contains `@{bot_username}`).
 fn build_message_from_post(
     post: &MattermostPost,
     runtime_key: &str,
@@ -1073,6 +1148,9 @@ struct MattermostUser {
 }
 
 impl MattermostUser {
+    /// Resolve the best available display name for this user.
+    ///
+    /// Priority order: nickname → "first last" (trimmed) → username.
     fn display_name(&self) -> String {
         if !self.nickname.is_empty() {
             return self.nickname.clone();
@@ -1154,6 +1232,13 @@ struct MattermostWsBroadcast {
     user_id: Option<String>,
 }
 
+/// Look up the display name for a Mattermost user by ID.
+///
+/// Returns the cached value if already resolved, otherwise calls
+/// `GET /api/v4/users/{user_id}` and caches the result. The resolved name
+/// follows the same priority order as [`MattermostUser::display_name`]:
+/// nickname → "first last" → username. Returns `None` on any network or
+/// API error (logged at `DEBUG` level).
 async fn resolve_user_display_name(
     cache: &RwLock<HashMap<String, String>>,
     client: &Client,
@@ -1191,6 +1276,12 @@ async fn resolve_user_display_name(
     Some(name)
 }
 
+/// Look up the display name for a Mattermost channel by ID.
+///
+/// Returns the cached value if already resolved, otherwise calls
+/// `GET /api/v4/channels/{channel_id}` and caches the result using the
+/// channel's `display_name` field. Returns `None` on any network or API
+/// error (logged at `DEBUG` level).
 async fn resolve_channel_name(
     cache: &RwLock<HashMap<String, String>>,
     client: &Client,
@@ -1248,6 +1339,12 @@ fn sanitize_reaction_name(emoji: &str) -> String {
         .to_lowercase()
 }
 
+/// Split `text` into chunks no longer than `max_len` bytes.
+///
+/// Splits preferentially on newlines, then on spaces, and falls back to a
+/// hard character-boundary break when no whitespace is found. All splits
+/// respect UTF-8 character boundaries. Leading whitespace is stripped from
+/// each chunk after a split.
 fn split_message(text: &str, max_len: usize) -> Vec<String> {
     if text.len() <= max_len {
         return vec![text.to_string()];

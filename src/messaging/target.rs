@@ -265,6 +265,13 @@ fn normalize_twitch_target(raw_target: &str) -> Option<String> {
     }
 }
 
+/// Extract the runtime adapter key from a Mattermost conversation ID.
+///
+/// Mattermost conversation IDs encode whether a named instance was used:
+/// - Default channel:  `mattermost:{team_id}:{channel_id}` (3 parts) → `"mattermost"`
+/// - Default DM:       `mattermost:{team_id}:dm:{user_id}` (4 parts, 3rd = `"dm"`) → `"mattermost"`
+/// - Named channel:    `mattermost:{instance}:{team_id}:{channel_id}` (4 parts, last ≠ `"dm"`) → `"mattermost:{instance}"`
+/// - Named DM:         `mattermost:{instance}:{team_id}:dm:{user_id}` (5 parts) → `"mattermost:{instance}"`
 fn extract_mattermost_adapter_from_channel_id(channel_id: &str) -> String {
     // Named instance conv IDs: "mattermost:{instance}:{team_id}:{channel_id}" (4 parts)
     //                      or: "mattermost:{instance}:{team_id}:dm:{user_id}" (5 parts)
@@ -282,6 +289,17 @@ fn extract_mattermost_adapter_from_channel_id(channel_id: &str) -> String {
     }
 }
 
+/// Normalize a raw Mattermost target string to a bare channel ID or `dm:{user_id}`.
+///
+/// Accepts any of the following forms (with or without a leading `mattermost:` prefix):
+/// - `channel_id` → `channel_id`
+/// - `dm:{user_id}` → `dm:{user_id}`
+/// - `{team_id}:{channel_id}` → `channel_id`
+/// - `{team_id}:dm:{user_id}` → `dm:{user_id}`
+/// - `{instance}:{team_id}:{channel_id}` → `channel_id`
+/// - `{instance}:{team_id}:dm:{user_id}` → `dm:{user_id}`
+///
+/// Returns `None` if the input is empty or does not match any recognised shape.
 fn normalize_mattermost_target(raw_target: &str) -> Option<String> {
     let target = strip_repeated_prefix(raw_target, "mattermost");
     // Parse out just the channel_id or dm:{user_id}, discarding any team/instance prefix.
