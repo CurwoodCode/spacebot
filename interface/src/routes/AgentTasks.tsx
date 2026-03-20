@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import { faCodeBranch, faExternalLinkAlt } from "@fortawesome/free-solid-svg-icons";
 import {
   api,
   type TaskItem,
@@ -56,6 +58,107 @@ const PRIORITY_COLORS: Record<
   medium: "default",
   low: "outline",
 };
+
+interface GithubReference {
+  kind: "issue" | "pr";
+  label: string;
+  url: string | null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readGithubReference(
+  value: unknown,
+  kind: GithubReference["kind"],
+): GithubReference | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const number = typeof value.number === "number" ? value.number : null;
+  const repo = typeof value.repo === "string" ? value.repo : null;
+  const url = typeof value.url === "string" ? value.url : null;
+
+  if (number === null && url === null && repo === null) {
+    return null;
+  }
+
+  const noun = kind === "issue" ? "Issue" : "PR";
+  const label = number !== null ? `${noun} #${number}` : repo ? `${noun} ${repo}` : noun;
+
+  return { kind, label, url };
+}
+
+function getGithubReferences(metadata: Record<string, unknown>): GithubReference[] {
+  const references = [
+    readGithubReference(metadata.github_issue, "issue"),
+    readGithubReference(metadata.github_pr, "pr"),
+  ].filter((reference): reference is GithubReference => reference !== null);
+
+  return references;
+}
+
+function GithubMetadataBadges({
+  metadata,
+  compact = false,
+}: {
+  metadata: Record<string, unknown>;
+  compact?: boolean;
+}) {
+  const references = getGithubReferences(metadata);
+  if (references.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {references.map((reference) => {
+        const content = (
+          <>
+            <FontAwesomeIcon icon={faCodeBranch} className="text-[10px]" />
+            <span>{reference.label}</span>
+            {reference.url && (
+              <FontAwesomeIcon icon={faExternalLinkAlt} className="text-[9px]" />
+            )}
+          </>
+        );
+
+        const className = compact
+          ? "cursor-pointer hover:border-blue-400/50 hover:text-blue-300"
+          : "cursor-pointer hover:border-blue-400/50 hover:bg-blue-500/20 hover:text-blue-300";
+
+        if (reference.url) {
+          return (
+            <a
+              key={`${reference.kind}-${reference.label}`}
+              href={reference.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <Badge variant="blue" size="sm" className={className}>
+                {content}
+              </Badge>
+            </a>
+          );
+        }
+
+        return (
+          <Badge
+            key={`${reference.kind}-${reference.label}`}
+            variant="blue"
+            size="sm"
+          >
+            {content}
+          </Badge>
+        );
+      })}
+    </div>
+  );
+}
 
 export function AgentTasks({ agentId }: { agentId: string }) {
   const queryClient = useQueryClient();
@@ -331,6 +434,7 @@ function TaskCard({
             Worker
           </Badge>
         )}
+        <GithubMetadataBadges metadata={task.metadata} compact />
       </div>
 
       {/* Subtask progress bar */}
@@ -574,6 +678,15 @@ function TaskDetailDialog({
                   </li>
                 ))}
               </ul>
+            </div>
+          )}
+
+          {getGithubReferences(task.metadata).length > 0 && (
+            <div>
+              <label className="mb-1 block text-xs text-ink-dull">
+                GitHub Links
+              </label>
+              <GithubMetadataBadges metadata={task.metadata} />
             </div>
           )}
 
